@@ -1,38 +1,25 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from rest_framework import status
 from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate
-import yaml
 
-from .models import Shop, Category, Product, ProductInfo, Order, OrderItem, Contact, Parameter, ProductParameter
-from .serializers import (ShopSerializer, CategorySerializer, ProductInfoSerializer,
-                          OrderSerializer, OrderItemSerializer, ContactSerializer, UserSerializer)
+from .models import Shop, Category, Product, ProductInfo, Order, OrderItem, Contact
+from .serializers import (RegisterSerializer, ShopSerializer, CategorySerializer, ProductInfoSerializer,
+                          OrderSerializer, ContactSerializer, UserSerializer)
+from .services import (
+    add_to_basket, remove_from_basket, place_order, update_order_status, ServiceError,
+)
 
 
 class RegisterView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        data = request.data
-        required = ['email', 'password', 'first_name', 'last_name', 'username']
-        for field in required:
-            if not data.get(field):
-                return Response({'error': f'Поле {field} обязательно'}, status=400)
-        from .models import User
-        if User.objects.filter(email=data['email']).exists():
-            return Response({'error': 'Пользователь с таким email уже существует'}, status=400)
-        user = User.objects.create_user(
-            email=data['email'],
-            username=data['username'],
-            password=data['password'],
-            first_name=data['first_name'],
-            last_name=data['last_name'],
-            company=data.get('company', ''),
-            position=data.get('position', ''),
-            user_type=data.get('user_type', 'buyer'),
-        )
+        serializer = RegisterSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=400)
+        user = serializer.save()
         token, _ = Token.objects.get_or_create(user=user)
         return Response({'token': token.key, 'email': user.email}, status=201)
 
@@ -130,34 +117,22 @@ class BasketView(APIView):
         return Response(serializer.data)
 
     def post(self, request):
-        product_info_id = request.data.get('product_info_id')
-        quantity = request.data.get('quantity', 1)
-        if not product_info_id:
-            return Response({'error': 'Укажите product_info_id'}, status=400)
         try:
-            product_info = ProductInfo.objects.get(pk=product_info_id)
-        except ProductInfo.DoesNotExist:
-            return Response({'error': 'Товар не найден'}, status=404)
-        if product_info.quantity < int(quantity):
-            return Response({'error': 'Недостаточно товара на складе'}, status=400)
-        order, _ = Order.objects.get_or_create(user=request.user, status='basket')
-        item, created = OrderItem.objects.get_or_create(
-            order=order, product_info=product_info,
-            defaults={'quantity': quantity}
-        )
-        if not created:
-            item.quantity += int(quantity)
-            item.save()
+            add_to_basket(
+                request.user,
+                request.data.get('product_info_id'),
+                request.data.get('quantity', 1),
+            )
+        except ServiceError as e:
+            return Response({'error': e.message}, status=e.status_code)
         return Response({'success': 'Товар добавлен в корзину'})
 
     def delete(self, request):
-        item_id = request.data.get('item_id')
         try:
-            item = OrderItem.objects.get(pk=item_id, order__user=request.user, order__status='basket')
-            item.delete()
-            return Response({'success': 'Товар удалён из корзины'})
-        except OrderItem.DoesNotExist:
-            return Response({'error': 'Товар не найден в корзине'}, status=404)
+            remove_from_basket(request.user, request.data.get('item_id'))
+        except ServiceError as e:
+            return Response({'error': e.message}, status=e.status_code)
+        return Response({'success': 'Товар удалён из корзины'})
 
 
 class OrderView(APIView):
@@ -174,19 +149,10 @@ class OrderView(APIView):
         return Response(serializer.data)
 
     def post(self, request):
-        contact_id = request.data.get('contact_id')
-        if not contact_id:
-            return Response({'error': 'Укажите contact_id'}, status=400)
         try:
-            contact = Contact.objects.get(pk=contact_id, user=request.user)
-        except Contact.DoesNotExist:
-            return Response({'error': 'Контакт не найден'}, status=404)
-        order = Order.objects.filter(user=request.user, status='basket').first()
-        if not order or not order.ordered_items.exists():
-            return Response({'error': 'Корзина пуста'}, status=400)
-        order.status = 'new'
-        order.contact = contact
-        order.save()
+            order = place_order(request.user, request.data.get('contact_id'))
+        except ServiceError as e:
+            return Response({'error': e.message}, status=e.status_code)
         try:
             from .emails import send_order_confirmation, send_order_notification_to_admin
             send_order_confirmation(order)
@@ -230,11 +196,15 @@ class PriceUpdateView(APIView):
         file = request.FILES.get('file')
         if not file:
             return Response({'error': 'Файл не передан'}, status=400)
-        import os
-        file_path = f'tmp_{request.user.id}.yaml'
-        with open(file_path, 'wb') as f:
+        import tempfile
+        # NamedTemporaryFile с delete=False вместо предсказуемого имени
+        # tmp_{user_id}.yaml: предсказуемое имя — гонка между параллельными
+        # запросами одного пользователя (вторая загрузка может перезаписать
+        # файл первой, пока та ещё не прочитана задачей Celery).
+        with tempfile.NamedTemporaryFile(suffix='.yaml', delete=False) as tmp:
             for chunk in file.chunks():
-                f.write(chunk)
+                tmp.write(chunk)
+            file_path = tmp.name
         from .tasks import do_import
         do_import.delay(file_path, request.user.id)
         return Response({'success': 'Импорт запущен, товары появятся через несколько секунд'})
@@ -291,13 +261,21 @@ class OrderStatusView(APIView):
         if request.user.user_type != 'shop':
             return Response({'error': 'Только для поставщиков'}, status=403)
         try:
+            # Проверяем, что заказ вообще существует
             order = Order.objects.get(pk=pk)
         except Order.DoesNotExist:
             return Response({'error': 'Заказ не найден'}, status=404)
-        new_status = request.data.get('status')
-        valid_statuses = ['confirmed', 'assembled', 'sent', 'delivered', 'cancelled']
-        if new_status not in valid_statuses:
-            return Response({'error': f'Допустимые статусы: {valid_statuses}'}, status=400)
-        order.status = new_status
-        order.save()
-        return Response({'success': f'Статус заказа №{order.id} обновлён на "{new_status}"'})
+
+        # Поставщик может менять статус только тех заказов, в которых есть
+        # его товары. Без этой проверки любой поставщик мог менять статус
+        # любого заказа — в том числе с чужими товарами.
+        if not order.ordered_items.filter(
+            product_info__shop__user=request.user
+        ).exists():
+            return Response({'error': 'Нет доступа к этому заказу'}, status=403)
+
+        try:
+            order = update_order_status(order, request.data.get('status'))
+        except ServiceError as e:
+            return Response({'error': e.message}, status=e.status_code)
+        return Response({'success': f'Статус заказа №{order.id} обновлён на "{order.status}"'})

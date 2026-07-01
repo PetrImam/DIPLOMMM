@@ -1,5 +1,53 @@
 from rest_framework import serializers
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from .models import User, Shop, Category, Product, ProductInfo, ProductParameter, Contact, Order, OrderItem
+
+
+class RegisterSerializer(serializers.ModelSerializer):
+    """
+    Сериализатор регистрации пользователя.
+    Пароль прогоняется через стандартные Django-валидаторы
+    (AUTH_PASSWORD_VALIDATORS из settings.py): минимальная длина,
+    проверка на схожесть с другими полями, "распространённость" пароля и т.д.
+    create_user() сам по себе эти проверки не выполняет, поэтому валидация
+    обязательно делается здесь, на уровне сериализатора.
+    """
+    password = serializers.CharField(write_only=True)
+
+    class Meta:
+        model = User
+        fields = ['email', 'username', 'password', 'first_name', 'last_name',
+                  'company', 'position', 'user_type']
+
+    def validate_password(self, value):
+        # validate_password принимает опционально экземпляр пользователя,
+        # чтобы UserAttributeSimilarityValidator мог сравнить пароль
+        # с email/именем — на момент регистрации полноценного instance ещё
+        # нет, поэтому собираем временный (несохранённый) объект из initial_data.
+        temp_user = User(
+            email=self.initial_data.get('email', ''),
+            username=self.initial_data.get('username', ''),
+            first_name=self.initial_data.get('first_name', ''),
+            last_name=self.initial_data.get('last_name', ''),
+        )
+        try:
+            validate_password(value, user=temp_user)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(list(e.messages))
+        return value
+
+    def validate_email(self, value):
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError('Пользователь с таким email уже существует')
+        return value
+
+    def create(self, validated_data):
+        password = validated_data.pop('password')
+        user = User(**validated_data)
+        user.set_password(password)
+        user.save()
+        return user
 
 
 class ContactSerializer(serializers.ModelSerializer):

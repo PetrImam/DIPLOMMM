@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+db.sqlite3
+staticfiles/
+media/
+venv/
+.venv/
+.idea/
+*.yaml.tmp
+tmp_*.yaml

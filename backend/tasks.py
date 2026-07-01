@@ -19,52 +19,39 @@ def send_email(subject, message, recipient_list):
 
 @shared_task
 def do_import(file_path, user_id):
-    """Асинхронный импорт товаров из YAML"""
-    from backend.models import Shop, Category, Product, ProductInfo, Parameter, ProductParameter
-    from django.contrib.auth import get_user_model
-    User = get_user_model()
+    """
+    Асинхронный импорт товаров из YAML.
+    Вся бизнес-логика (проверка владельца магазина, транзакция,
+    update_or_create вместо delete+create) вынесена в services.import_price_list —
+    задача отвечает только за чтение файла, парсинг YAML и удаление временного файла.
+    """
+    import os
+    from backend.models import User
+    from backend.services import import_price_list, ServiceError
 
     try:
         user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        return f'Ошибка импорта: пользователь id={user_id} не найден'
+
+    if user.user_type != 'shop':
+        return 'Ошибка импорта: импортировать прайс-лист может только пользователь типа "shop"'
+
+    try:
         with open(file_path, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        return f'Ошибка импорта: некорректный YAML ({e})'
+    finally:
+        # временный файл больше не нужен независимо от результата парсинга
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-        shop, _ = Shop.objects.get_or_create(user=user, defaults={'name': data.get('shop', '')})
-        shop.name = data.get('shop', shop.name)
-        shop.save()
+    try:
+        shop, goods_count = import_price_list(data, user)
+    except ServiceError as e:
+        return f'Ошибка импорта: {e.message}'
+    except (KeyError, TypeError) as e:
+        return f'Ошибка импорта: в YAML отсутствует обязательное поле {e}'
 
-        for category_data in data.get('categories', []):
-            category, _ = Category.objects.get_or_create(
-                id=category_data['id'],
-                defaults={'name': category_data['name']}
-            )
-            category.shops.add(shop)
-
-        ProductInfo.objects.filter(shop=shop).delete()
-
-        for item in data.get('goods', []):
-            category = Category.objects.get(id=item['category'])
-            product, _ = Product.objects.get_or_create(name=item['name'], category=category)
-
-            product_info = ProductInfo.objects.create(
-                product=product,
-                shop=shop,
-                external_id=item['id'],
-                model=item.get('model', ''),
-                quantity=item['quantity'],
-                price=item['price'],
-                price_rrc=item['price_rrc'],
-            )
-
-            for param_name, param_value in item.get('parameters', {}).items():
-                parameter, _ = Parameter.objects.get_or_create(name=param_name)
-                ProductParameter.objects.create(
-                    product_info=product_info,
-                    parameter=parameter,
-                    value=str(param_value),
-                )
-
-        return f'Импорт завершён: {len(data.get("goods", []))} товаров'
-
-    except Exception as e:
-        return f'Ошибка импорта: {str(e)}'
+    return f'Импорт завершён: магазин "{shop.name}", {goods_count} позиций'
